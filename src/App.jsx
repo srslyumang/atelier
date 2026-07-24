@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 
 /* ============================================================
    ATELIER v4 — Umang's default home.
@@ -104,6 +104,15 @@ function ytId(url) {
 function ytList(url) {
   const m = (url || "").match(/[?&]list=([A-Za-z0-9_-]+)/);
   return m ? m[1] : null;
+}
+/* pull a mix's real title straight from YouTube — no API key, oEmbed is public + CORS-open */
+async function fetchYtTitle(url) {
+  try {
+    const r = await fetch("https://www.youtube.com/oembed?format=json&url=" + encodeURIComponent((url || "").trim()));
+    if (!r.ok) return "";
+    const j = await r.json();
+    return (j.title || "").trim();
+  } catch (e) { return ""; }
 }
 
 /* seeded rng — one universe per date */
@@ -398,6 +407,80 @@ const DailyMarks = ({ seed }) => {
   );
 };
 
+/* ---------- MINI PLAYER (drag by the header, resize from the corner) ---------- */
+function MiniPlayer({ mix, min, setMin, close }) {
+  const mobile = typeof window !== "undefined" && window.innerWidth <= 760;
+  const [box, setBox] = useState(() => ({
+    x: Math.max(12, (typeof window !== "undefined" ? window.innerWidth : 1200) - 340),
+    y: Math.max(12, (typeof window !== "undefined" ? window.innerHeight : 800) - 260),
+    w: 320,
+  }));
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef(null);
+  const rez = useRef(null);
+
+  useEffect(() => {
+    const move = (e) => {
+      if (drag.current) {
+        const d = drag.current;
+        const nx = Math.max(0, Math.min(d.ox + (e.clientX - d.sx), window.innerWidth - 90));
+        const ny = Math.max(0, Math.min(d.oy + (e.clientY - d.sy), window.innerHeight - 44));
+        setBox((b) => ({ ...b, x: nx, y: ny }));
+      } else if (rez.current) {
+        const z = rez.current;
+        const nw = Math.max(220, Math.min(z.ow + (e.clientX - z.sx), window.innerWidth - 24));
+        setBox((b) => ({ ...b, w: nw }));
+      }
+    };
+    const up = () => {
+      if (drag.current || rez.current) {
+        drag.current = null; rez.current = null; setDragging(false); document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+  }, []);
+
+  const startDrag = (e) => {
+    if (mobile || e.target.closest(".mini-b")) return;
+    drag.current = { sx: e.clientX, sy: e.clientY, ox: box.x, oy: box.y };
+    setDragging(true); document.body.style.userSelect = "none";
+  };
+  const startRez = (e) => {
+    if (mobile) return;
+    e.stopPropagation();
+    rez.current = { sx: e.clientX, ow: box.w };
+    setDragging(true); document.body.style.userSelect = "none";
+  };
+
+  const style = mobile ? undefined : { left: box.x, top: box.y, width: box.w, right: "auto", bottom: "auto" };
+
+  return (
+    <div className={"mini" + (min ? " min" : "") + (dragging ? " dragging" : "")} style={style}>
+      <div className="mini-bar" onMouseDown={startDrag}>
+        <div className="eq" aria-hidden="true"><i /><i /><i /><i /></div>
+        <span className="mini-label">{mix.label}</span>
+        <button className="mini-b" onClick={() => setMin(!min)}>{min ? "▲" : "▼"}</button>
+        <button className="mini-b" onClick={close}>×</button>
+      </div>
+      <div className="mini-frame">
+        <iframe
+          title={mix.label}
+          src={
+            mix.list
+              ? `https://www.youtube.com/embed/videoseries?list=${mix.list}&autoplay=1&playsinline=1`
+              : `https://www.youtube.com/embed/${mix.vid}?autoplay=1&playsinline=1`
+          }
+          allow="autoplay; encrypted-media; picture-in-picture"
+          allowFullScreen
+        />
+      </div>
+      {!min && !mobile && <div className="mini-rez" onMouseDown={startRez} aria-hidden="true" title="drag to resize" />}
+    </div>
+  );
+}
+
 /* ---------- main ---------- */
 
 export default function Atelier() {
@@ -532,26 +615,7 @@ export default function Atelier() {
       )}
 
       {nowPlaying && (
-        <div className={"mini" + (playerMin ? " min" : "")}>
-          <div className="mini-bar">
-            <div className="eq" aria-hidden="true"><i /><i /><i /><i /></div>
-            <span className="mini-label">{nowPlaying.label}</span>
-            <button className="mini-b" onClick={() => setPlayerMin(!playerMin)}>{playerMin ? "▲" : "▼"}</button>
-            <button className="mini-b" onClick={() => setNowPlaying(null)}>×</button>
-          </div>
-          <div className="mini-frame">
-            <iframe
-              title={nowPlaying.label}
-              src={
-                nowPlaying.list
-                  ? `https://www.youtube.com/embed/videoseries?list=${nowPlaying.list}&autoplay=1&playsinline=1`
-                  : `https://www.youtube.com/embed/${nowPlaying.vid}?autoplay=1&playsinline=1`
-              }
-              allow="autoplay; encrypted-media; picture-in-picture"
-              allowFullScreen
-            />
-          </div>
-        </div>
+        <MiniPlayer mix={nowPlaying} min={playerMin} setMin={setPlayerMin} close={() => setNowPlaying(null)} />
       )}
     </div>
   );
@@ -1048,14 +1112,31 @@ function Studio({ notes, setNotes }) {
 function Sound({ mixes, setMixes, nowPlaying, setNowPlaying, setPlayerMin }) {
   const [url, setUrl] = useState("");
   const [label, setLabel] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const labelEdited = useRef(false);
 
-  const add = () => {
+  // let the link name itself — fill the title unless you've typed your own
+  const pullTitle = async (u) => {
+    if ((!ytId(u) && !ytList(u)) || (labelEdited.current && label.trim())) return;
+    setFetching(true);
+    const t = await fetchYtTitle(u);
+    setFetching(false);
+    if (t && !(labelEdited.current && label.trim())) setLabel(t);
+  };
+
+  const add = async () => {
     const vid = ytId(url);
     const list = ytList(url);
     if (!vid && !list) return;
-    const m = { id: uid(), vid, list, url: url.trim(), label: label.trim() || "untitled mix" };
+    let name = label.trim();
+    if (!name) {
+      setFetching(true);
+      name = (await fetchYtTitle(url)) || "untitled mix";
+      setFetching(false);
+    }
+    const m = { id: uid(), vid, list, url: url.trim(), label: name };
     setMixes([m, ...mixes]);
-    setUrl(""); setLabel("");
+    setUrl(""); setLabel(""); labelEdited.current = false;
     setNowPlaying(m); setPlayerMin(false);
   };
   const remove = (id) => setMixes(mixes.filter((m) => m.id !== id));
@@ -1071,8 +1152,12 @@ function Sound({ mixes, setMixes, nowPlaying, setNowPlaying, setPlayerMin }) {
       </div>
 
       <div className="sound-add">
-        <input placeholder="Paste a YouTube link — video OR playlist" value={url} onChange={(e) => setUrl(e.target.value)} />
-        <input placeholder="Name it — e.g. 'late night sampling fuel'" value={label} onChange={(e) => setLabel(e.target.value)} />
+        <input placeholder="Paste a YouTube link — video OR playlist" value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onBlur={() => pullTitle(url)}
+          onPaste={(e) => { const v = e.clipboardData.getData("text"); if (v) setTimeout(() => pullTitle(v), 0); }} />
+        <input placeholder={fetching ? "pulling the title…" : "Name it — or leave blank, the link names itself"} value={label}
+          onChange={(e) => { labelEdited.current = true; setLabel(e.target.value); }} />
         <button className="act sun" onClick={add}>SAVE + SPIN</button>
       </div>
       <div className="hint">
@@ -1472,7 +1557,11 @@ textarea:focus, input:focus { box-shadow: 4px 4px 0 var(--line); }
 .mixlist li.on .mix-b { font-weight: 700; color: ${ACC.sun}; }
 
 .mini { position: fixed; right: 20px; bottom: 20px; width: 320px; z-index: 50; border: 3px solid var(--line); background: var(--bg); box-shadow: 7px 7px 0 var(--line); }
-.mini-bar { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 3px solid var(--line); }
+.mini.dragging { user-select: none; }
+.mini.dragging .mini-frame iframe { pointer-events: none; }
+.mini-bar { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 3px solid var(--line); cursor: move; }
+.mini-rez { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px; cursor: nwse-resize; border-right: 3px solid var(--line); border-bottom: 3px solid var(--line); opacity: .5; z-index: 3; }
+.mini-rez:hover { opacity: 1; }
 .mini.min .mini-bar { border-bottom: none; }
 .mini-label { flex: 1; font-family: 'Space Mono', monospace; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mini-b { background: none; border: none; color: var(--fg); cursor: pointer; font-size: 13px; opacity: .7; }
